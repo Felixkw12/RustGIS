@@ -629,7 +629,10 @@ fn landed_link(app: &mut RustGisApp, url: &str, r: Result<Vec<u8>, String>) {
                 app.ui.stac.info = Some(format!("{} · {}", app.ui.stac.info.clone().unwrap_or_default(), unknown(app)));
             }
         }
-        _ => app.ui.stac.error = Some(i18n::fmt("{url}: not a STAC item or collection", &[("url", url)])),
+        _ => {
+            app.ui.stac.error =
+                Some(i18n::fmt("{url}: not a STAC item or collection", &[("url", &rustgis_engine::sources::address_in_message(url))]))
+        }
     }
 }
 
@@ -1243,6 +1246,7 @@ mod tests {
 
     #[test]
     fn a_deferred_token_add_keeps_its_original_connection_when_selection_changes() {
+        let _turn = crate::fetching::turn();
         let mut app = RustGisApp::with_sample();
         let api = "http://127.0.0.1:9/stac";
         let one = app.run("connection.new", json!({"kind":"stac", "name":"One", "address":api})).unwrap();
@@ -1260,7 +1264,7 @@ mod tests {
         app.ui.stac.waiting = Some((asked, slot));
         app.ui.stac.connection = two["id"].as_str().map(str::to_string);
         poll(&mut app, &egui::Context::default());
-        let (_, _, params, _) = app.ui.downloads.last().unwrap();
+        let params = &app.ui.downloads.last().unwrap().params;
         assert_eq!(params["connection"], one["id"], "token completion must not re-read the picker");
         assert_ne!(params["connection"], two["id"]);
     }
@@ -1341,6 +1345,7 @@ mod tests {
     /// the dropped listing doesn't hold it up.
     #[test]
     fn a_catalog_picked_during_a_pending_listing_is_browsed() {
+        let _turn = crate::fetching::turn();
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::with_sample();
         // Nothing listens on port 9 of the loopback address: the browse is refused, harmlessly.

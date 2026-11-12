@@ -1,4 +1,5 @@
 use super::*;
+use crate::raster::wkt::tests::{PlacementCase, metres_apart, placement_cases};
 
 fn varuint(mut v: u64) -> Vec<u8> {
     let mut out = Vec::new();
@@ -657,4 +658,52 @@ fn reads_what_gdal_writes_when_gdal_is_installed() {
     // One layer by name, ignoring case.
     assert_eq!(read_dir(&gdb, Some("BLOCKS")).unwrap().layers.len(), 1);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Another body's system in a File Geodatabase or an ArcGIS page (Mars, IAU 2015) is read as its
+/// longitude/latitude with one notice, refused when it can't be converted, and an Earth system
+/// that can't be converted is read as longitude/latitude, as before.
+#[test]
+fn planetary_systems_are_said_or_refused() {
+    let gcs = r#"GEOGCS["GCS_Mars_2015_-_Sphere_Ocentric",DATUM["D_Mars_2015_-_Sphere",SPHEROID["Mars_2015_-_Sphere",3396190.0,0.0]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    let bonne = |gcs: &str| {
+        format!(
+            r#"PROJCS["Bonne",{gcs},PROJECTION["Bonne"],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",30.0],UNIT["Meter",1.0]]"#
+        )
+    };
+    let body = |m: &String| m.contains("belongs to another body than the Earth");
+    let mut report = ReadReport::default();
+    let (crs, t) = esri_crs(None, Some(gcs), &mut report).unwrap();
+    assert!(crs.is_some_and(Crs::is_planetary) && t.is_some());
+    assert_eq!(report.messages.iter().filter(|m| body(m)).count(), 1, "{:?}", report.messages);
+    let e = esri_crs(None, Some(&bonne(gcs)), &mut ReadReport::default()).err().unwrap().to_string();
+    assert!(e.contains("belongs to another body than the Earth") && e.contains("Bonne"), "{e}");
+    let earth = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
+    let mut report = ReadReport::default();
+    let (crs, t) = esri_crs(None, Some(&bonne(earth)), &mut report).unwrap();
+    assert!(crs.is_none() && t.is_none());
+    assert!(report.messages.iter().any(|m| m.contains("Bonne")) && !report.messages.iter().any(body), "{:?}", report.messages);
+}
+
+/// #1486: the projected placement cases, as a feature class's WKT. (A File Geodatabase holds Esri
+/// WKT1, which has no bound systems.)
+#[test]
+fn placement_cases_are_placed() {
+    for PlacementCase { what, wkt, xy, lonlat } in placement_cases() {
+        if !wkt.starts_with("PROJCS[") {
+            continue;
+        }
+        // `F::Shape` takes a `&'static str`, as its other uses are constants: the few cases' text
+        // is leaked for the test's run.
+        let fields = [F::Oid, F::Shape { z: false, wkt: wkt.leak() }];
+        let rows = vec![vec![V::Blob(polygon(&square(xy.x, xy.y, 1.0)))]];
+        let files = geodatabase(vec![("T", table(4, &fields, &rows))]);
+        let layers = read_files(&files).unwrap();
+        let (ds, report) = &layers[0];
+        assert!(report.messages.is_empty(), "{what}: {:?}", report.messages);
+        let Some(Geometry::Polygon(p)) = &ds.features[0].geometry else { panic!("{what}: {:?}", ds.features[0].geometry) };
+        // The corner at the point (stored to the millimetre) is within a centimetre of it.
+        let off = p[0][0].iter().map(|c| metres_apart(*c, lonlat)).fold(f64::INFINITY, f64::min);
+        assert!(off < 0.01, "{what}: {off} m off");
+    }
 }

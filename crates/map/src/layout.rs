@@ -4,6 +4,8 @@
 //! Element positions are in millimetres from the page's top-left corner. A map frame shows a map
 //! of the project at its own centre and scale, independent of the map view.
 
+use std::collections::BTreeMap;
+
 use rustgis_geom::Coord;
 use serde::{Deserialize, Serialize};
 
@@ -462,6 +464,12 @@ fn is_left(a: &TextAlign) -> bool {
 /// The most layers a legend leaves out.
 pub const MAX_LEGEND_EXCLUDED: usize = 1000;
 
+/// The most layers a legend labels.
+pub const MAX_LEGEND_LABELS: usize = 1000;
+
+/// The most characters of a legend's label for a layer.
+pub const MAX_LEGEND_LABEL_CHARS: usize = 200;
+
 /// Which way a line element runs across its box.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineDir {
@@ -793,6 +801,17 @@ fn divisions() -> usize {
     4
 }
 
+/// The most columns a legend lays its rows in.
+pub const MAX_LEGEND_COLUMNS: usize = 3;
+
+fn one_column() -> usize {
+    1
+}
+
+fn is_one_column(columns: &usize) -> bool {
+    *columns == 1
+}
+
 fn ink() -> Rgba {
     Rgba::rgb(0x22, 0x22, 0x22)
 }
@@ -912,6 +931,15 @@ pub enum ElementKind {
         /// highlight, a basemap-like layer. Empty, it lists every layer it would otherwise.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         exclude: Vec<String>,
+        /// The columns its rows are laid in, 1 to [`MAX_LEGEND_COLUMNS`], under its title: as even
+        /// as they can be, a layer's name staying with the row under it.
+        #[serde(default = "one_column", skip_serializing_if = "is_one_column")]
+        columns: usize,
+        /// The label it shows for a layer instead of the layer's name, by the layer's name (any
+        /// case, as the map spells it): its row, or the name over its classes (#1654). The layer
+        /// keeps its name everywhere else. A layer not in it shows its name.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        labels: BTreeMap<String, String>,
     },
     /// The colour scale of a raster layer in a frame's map: a gradient bar for a stretch, steps
     /// for classes, a block per value for unique values and colour tables (#326).
@@ -961,6 +989,11 @@ pub enum ElementKind {
         /// (trimmed, bounded, none when not a name).
         #[serde(default, deserialize_with = "crate::symbology::de_font", skip_serializing_if = "Option::is_none")]
         font_name: Option<String>,
+        /// Turned about the centre of its box, in degrees clockwise as a frame's `bearing` is
+        /// (90 reads top to bottom, -90 bottom to top), -180 to 180 ([`rotation()`]); the element's
+        /// box stays the unturned one. Left out when 0, so layouts saved before keep their bytes.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        rotation: f64,
     },
     Picture {
         /// Base64 PNG or JPEG.
@@ -1023,6 +1056,7 @@ impl ElementKind {
             letter_spacing: 0.0,
             font: FontFamily::Sans,
             font_name: None,
+            rotation: 0.0,
         }
     }
 
@@ -1108,9 +1142,49 @@ pub struct Element {
 }
 
 impl Element {
+    /// Whether the point (mm) is on the element, its box turned as it is drawn.
     pub fn contains(&self, x: f64, y: f64) -> bool {
+        let (x, y) = self.unturned(x, y);
         x >= self.x && x <= self.x + self.w && y >= self.y && y <= self.y + self.h
     }
+
+    /// How far it is turned about its centre, in degrees clockwise: a text's `rotation`, else 0.
+    pub fn rotation(&self) -> f64 {
+        match self.kind {
+            ElementKind::Text { rotation, .. } => rotation,
+            _ => 0.0,
+        }
+    }
+
+    /// The point (mm) seen in the element's unturned box: turned back about its centre.
+    pub fn unturned(&self, x: f64, y: f64) -> (f64, f64) {
+        if self.rotation() == 0.0 {
+            return (x, y);
+        }
+        let (cx, cy) = (self.x + self.w / 2.0, self.y + self.h / 2.0);
+        let (sin, cos) = (-self.rotation()).to_radians().sin_cos();
+        let (dx, dy) = (x - cx, y - cy);
+        (cx + dx * cos - dy * sin, cy + dx * sin + dy * cos)
+    }
+
+    /// The rectangle (x, y, w, h in mm) its turned box takes up on the page: its box when it isn't
+    /// turned.
+    pub fn bounds(&self) -> (f64, f64, f64, f64) {
+        let (sin, cos) = self.rotation().to_radians().sin_cos();
+        let (w, h) = (self.w * cos.abs() + self.h * sin.abs(), self.w * sin.abs() + self.h * cos.abs());
+        (self.x + (self.w - w) / 2.0, self.y + (self.h - h) / 2.0, w, h)
+    }
+}
+
+/// An angle in degrees as a text's `rotation` keeps it: within -180..=180 (450 is 90, 270 is -90),
+/// 0 when it isn't a number.
+pub fn rotation(degrees: f64) -> f64 {
+    if !degrees.is_finite() {
+        return 0.0;
+    }
+    let a = degrees.rem_euclid(360.0);
+    // `rem_euclid` of a tiny negative angle can round to 360 itself.
+    if a > 180.0 { a - 360.0 } else { a }
 }
 
 /// A map series: one page per feature of an index layer, the main frame zoomed to each.
@@ -1261,8 +1335,11 @@ impl Layout {
     }
 
     /// Keeps the page and elements sane after loading or editing (layout files are untrusted):
-    /// sizes in range, unique element ids, and no references to missing frames.
-    pub fn clamp(&mut self) {
+    /// sizes in range, unique element ids, and no references to missing frames. Returns what it
+    /// changed, so a project reader can say so.
+    pub fn clamp(&mut self) -> LayoutRepairs {
+        let page = (self.width, self.height, self.guides.clone(), self.series.clone());
+        let count = self.elements.len();
         self.width = finite_or(self.width, 210.0).clamp(20.0, 5000.0);
         self.height = finite_or(self.height, 297.0).clamp(20.0, 5000.0);
         // The same limits `layout.guides` sets: the view walks these lists every frame.
@@ -1273,7 +1350,27 @@ impl Layout {
         self.elements.truncate(500);
         let mut seen = std::collections::HashSet::new();
         let mut next = self.elements.iter().map(|e| e.id).filter(|id| *id <= MAX_ID).max().unwrap_or(0).saturating_add(1);
+        let mut changed = Vec::with_capacity(self.elements.len());
         for e in &mut self.elements {
+            // A picture's image (often large) is never changed here, so it isn't copied.
+            let mut before = Element {
+                name: e.name.clone(),
+                kind: match &e.kind {
+                    ElementKind::Picture { .. } => ElementKind::Picture { image: String::new() },
+                    kind => kind.clone(),
+                },
+                ..*e
+            };
+            // A bearing past half a turn names the same direction once normalized, and a pitch
+            // too small to tilt is drawn flat: neither is a change.
+            if let ElementKind::MapFrame { bearing, pitch, .. } = &mut before.kind {
+                if bearing.is_finite() {
+                    *bearing = crate::camera::normalize_bearing(*bearing);
+                }
+                if (0.0..1e-6).contains(pitch) {
+                    *pitch = 0.0;
+                }
+            }
             // Ids stay well below u32::MAX so new elements never run out of numbers. A repeated id
             // (only a hand-edited file has one) is renumbered; references to it keep meaning the
             // first element with that id, as they did when the file was written.
@@ -1286,6 +1383,7 @@ impl Layout {
             e.h = finite_or(e.h, 20.0).clamp(MIN_ELEMENT_MM, 5000.0);
             e.x = finite_or(e.x, 0.0).clamp(-5000.0, 5000.0);
             e.y = finite_or(e.y, 0.0).clamp(-5000.0, 5000.0);
+            let mut cut = e.name.chars().nth(200).is_some();
             e.name = e.name.chars().take(200).collect();
             match &mut e.kind {
                 ElementKind::MapFrame { center, scale, shape, grid, bearing, pitch, extent_width, .. } => {
@@ -1299,8 +1397,10 @@ impl Layout {
                     center.x = center.x.clamp(-540.0, 540.0);
                     center.y = center.y.clamp(-85.0, 85.0);
                     if let FrameShape::Polygon(p) = shape {
+                        let points = p.len();
                         p.retain(|(u, v)| u.is_finite() && v.is_finite());
                         p.truncate(10_000);
+                        cut |= p.len() < points;
                         p.iter_mut().for_each(|(u, v)| (*u, *v) = (u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)));
                         if p.len() < 3 {
                             *shape = FrameShape::Rectangle;
@@ -1318,15 +1418,37 @@ impl Layout {
                         g.width = finite_or(g.width, grid_width()).clamp(0.0, MAX_GRID_WIDTH);
                     }
                 }
-                ElementKind::Legend { exclude, .. } => {
+                ElementKind::Legend { exclude, columns, labels, .. } => {
                     // Names stay whole: a layer's own name isn't cut, and a cut one would no
                     // longer match it.
+                    cut |= exclude.len() > MAX_LEGEND_EXCLUDED;
                     exclude.truncate(MAX_LEGEND_EXCLUDED);
+                    *columns = (*columns).clamp(1, MAX_LEGEND_COLUMNS);
+                    // The same for the names labelled; a label is cut to its length, and a blank
+                    // one shows the name, as it would without.
+                    labels.retain(|_, label| !label.trim().is_empty());
+                    let labelled = labels.len();
+                    // One label per layer, as a command keeps: of two spellings of a name (any
+                    // case), the first in order stays and the other is cut.
+                    let mut seen = std::collections::HashSet::new();
+                    labels.retain(|name, _| seen.insert(name.to_ascii_lowercase()));
+                    while labels.len() > MAX_LEGEND_LABELS {
+                        labels.pop_last();
+                    }
+                    cut |= labels.len() < labelled;
+                    for label in labels.values_mut() {
+                        let end = label.char_indices().nth(MAX_LEGEND_LABEL_CHARS).map_or(label.len(), |(i, _)| i);
+                        cut |= end < label.len();
+                        label.truncate(end);
+                    }
                 }
-                ElementKind::Text { text, size, letter_spacing, .. } => {
+                ElementKind::Text { text, size, letter_spacing, rotation: turn, .. } => {
+                    *turn = rotation(*turn);
                     *size = finite_or(*size, 12.0).clamp(*crate::graphics::FONT_SIZE.start(), *crate::graphics::FONT_SIZE.end());
                     *letter_spacing = finite_or(*letter_spacing, 0.0).clamp(MIN_LETTER_SPACING, MAX_LETTER_SPACING);
-                    text.truncate(text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i));
+                    let end = text.char_indices().nth(5000).map_or(text.len(), |(i, _)| i);
+                    cut |= end < text.len();
+                    text.truncate(end);
                 }
                 ElementKind::Table { rows, .. } => *rows = (*rows).clamp(1, 500),
                 ElementKind::ScaleBar { divisions, .. } => *divisions = (*divisions).clamp(1, MAX_SCALE_DIVISIONS),
@@ -1336,26 +1458,75 @@ impl Layout {
                 ElementKind::Line { width, .. } => *width = finite_or(*width, 1.0).clamp(0.1, 50.0),
                 _ => {}
             }
+            let kind_changed = !matches!(e.kind, ElementKind::Picture { .. }) && e.kind != before.kind;
+            changed.push((
+                kind_changed
+                    || (e.id, &e.name, e.x, e.y, e.w, e.h, e.visible, e.locked)
+                        != (before.id, &before.name, before.x, before.y, before.w, before.h, before.visible, before.locked),
+                cut,
+            ));
         }
         self.next_id = next;
         // References must point at map frames that exist.
         let frames: std::collections::HashSet<u32> =
             self.elements.iter().filter(|e| matches!(e.kind, ElementKind::MapFrame { .. })).map(|e| e.id).collect();
-        self.elements.retain(|e| e.kind.frame().is_none_or(|f| frames.contains(&f)));
-        for e in &mut self.elements {
+        let (mut adjusted, mut cut_count) = (0usize, 0usize);
+        let elements = std::mem::take(&mut self.elements);
+        for (mut e, (mut changed, cut)) in elements.into_iter().zip(changed) {
+            if e.kind.frame().is_some_and(|f| !frames.contains(&f)) {
+                continue;
+            }
             if let ElementKind::MapFrame { extent_of, .. } = &mut e.kind
                 && extent_of.is_some_and(|o| !frames.contains(&o) || o == e.id)
             {
                 *extent_of = None;
+                changed = true;
             }
+            adjusted = adjusted.saturating_add(usize::from(changed));
+            cut_count = cut_count.saturating_add(usize::from(cut));
+            self.elements.push(e);
         }
+        let mut series_removed = false;
         if let Some(s) = &mut self.series {
             if !frames.contains(&s.frame) {
                 self.series = None;
+                series_removed = true;
             } else {
                 s.margin = finite_or(s.margin, 0.1).clamp(0.0, 5.0);
             }
         }
+        let series_adjusted = !series_removed && self.series != page.3;
+        let page_adjusted = series_adjusted || (self.width, self.height, &self.guides) != (page.0, page.1, &page.2);
+        LayoutRepairs {
+            elements_adjusted: adjusted,
+            elements_cut: cut_count,
+            elements_removed: count.saturating_sub(self.elements.len()),
+            page_adjusted: usize::from(page_adjusted),
+            series_removed: usize::from(series_removed),
+        }
+    }
+}
+
+/// What [`Layout::clamp`] changed in a layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutRepairs {
+    /// Elements kept with a value brought into range, a new id, or a reference cleared.
+    pub elements_adjusted: usize,
+    /// Elements with a name, text, polygon points, legend exclusions or legend labels cut to their
+    /// limits (the same element may count as adjusted too).
+    pub elements_cut: usize,
+    /// Elements removed: beyond the 500 a layout holds, or tied to a map frame it doesn't have.
+    pub elements_removed: usize,
+    /// Whether the page size, guides or map series margin changed (0 or 1).
+    pub page_adjusted: usize,
+    /// Whether the map series was removed, its map frame missing (0 or 1).
+    pub series_removed: usize,
+}
+
+impl LayoutRepairs {
+    /// Whether nothing was changed.
+    pub fn is_empty(&self) -> bool {
+        *self == LayoutRepairs::default()
     }
 }
 
@@ -1612,7 +1783,21 @@ mod tests {
             {"id":9,"name":"c","x":0,"y":0,"w":10,"h":10,"kind":{"Legend":{"frame":42,"title":"L"}}}],
             "series":{"frame":77,"layer":"x"}}"#;
         let mut l: Layout = serde_json::from_str(text).unwrap_or_else(|e| panic!("{e}"));
-        l.clamp();
+        let repairs = l.clamp();
+        assert_eq!(
+            repairs,
+            LayoutRepairs { elements_adjusted: 2, elements_cut: 0, elements_removed: 1, page_adjusted: 1, series_removed: 1 },
+            "what changed is counted"
+        );
+        assert!(l.clamp().is_empty(), "a repaired layout needs nothing more");
+        if let ElementKind::MapFrame { bearing, .. } = &mut l.elements[0].kind {
+            *bearing = 270.0;
+        }
+        assert!(l.clamp().is_empty(), "a bearing of 270 is -90 by another name, not a repair");
+        if let ElementKind::MapFrame { pitch, .. } = &mut l.elements[0].kind {
+            *pitch = 1e-7;
+        }
+        assert!(l.clamp().is_empty(), "a pitch too small to tilt is flat, not a repair");
         let ids: Vec<u32> = l.elements.iter().map(|e| e.id).collect();
         assert_eq!(ids.len(), 2, "the legend of a missing frame goes");
         assert_ne!(ids[0], ids[1], "duplicate ids are renumbered");
@@ -1820,6 +2005,58 @@ mod tests {
         assert_eq!(grid, Grid { step: 10.0, ..Grid::default() });
         assert_eq!(grid.edges, GridEdges { top: false, bottom: true, left: true, right: false });
         assert_eq!(grid.style, GridStyle::Lines);
+    }
+
+    /// A text turned 90° or -90° (#1763) keeps its turn through a save; one saved before reads
+    /// upright and is written back byte for byte; a turn read from a file is kept within -180 to
+    /// 180.
+    #[test]
+    fn text_rotation_round_trips_and_old_layouts_keep_their_bytes() {
+        let turn_of = |l: &Layout, id: u32| l.element(id).map(Element::rotation);
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let upright = l.add("Title", (10.0, 10.0, 60.0, 10.0), ElementKind::text("Brasil", 12.0, Rgba::rgb(0, 0, 0), false));
+        let old = serde_json::to_string(&l).unwrap();
+        assert!(!old.contains("rotation"), "an upright text writes no turn");
+        let back: Layout = serde_json::from_str(&old).unwrap();
+        assert_eq!(turn_of(&back, upright), Some(0.0));
+        assert_eq!(serde_json::to_string(&back).unwrap(), old, "written back byte for byte");
+        for turn in [90.0, -90.0] {
+            let mut l = l.clone();
+            if let Some(ElementKind::Text { rotation, .. }) = l.element_mut(upright).map(|e| &mut e.kind) {
+                *rotation = turn;
+            }
+            let back: Layout = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+            assert_eq!(turn_of(&back, upright), Some(turn));
+        }
+        // Read from a file, a turn is kept within -180..=180.
+        let file = old.replace(r#""bold":false"#, r#""bold":false,"rotation":450"#);
+        let mut read: Layout = serde_json::from_str(&file).unwrap();
+        read.clamp();
+        assert_eq!(turn_of(&read, upright), Some(90.0));
+        assert_eq!(
+            [rotation(270.0), rotation(-270.0), rotation(180.0), rotation(-180.0), rotation(f64::NAN)],
+            [-90.0, 90.0, 180.0, 180.0, 0.0]
+        );
+    }
+
+    /// A turned text is hit, and takes up the page, where it is drawn: its box turned about its
+    /// centre (#1763).
+    #[test]
+    fn a_turned_text_is_hit_on_its_turned_box() {
+        let mut l = Layout::new("L", 100.0, 100.0);
+        let id = l.add("Source", (20.0, 45.0, 60.0, 10.0), ElementKind::text("Fonte: IBGE", 8.0, Rgba::rgb(0, 0, 0), false));
+        // Upright: 60 wide, 10 high, centred on (50, 50).
+        assert_eq!((l.hit(25.0, 50.0), l.hit(50.0, 25.0)), (Some(id), None));
+        if let Some(ElementKind::Text { rotation, .. }) = l.element_mut(id).map(|e| &mut e.kind) {
+            *rotation = 90.0;
+        }
+        // Turned: 10 wide, 60 high, about the same centre.
+        assert_eq!((l.hit(25.0, 50.0), l.hit(50.0, 25.0)), (None, Some(id)));
+        let (x, y, w, h) = l.element(id).unwrap().bounds();
+        assert!((x - 45.0).abs() < 1e-9 && (y - 20.0).abs() < 1e-9 && (w - 10.0).abs() < 1e-9 && (h - 60.0).abs() < 1e-9);
+        // The element keeps its unturned box.
+        let e = l.element(id).unwrap();
+        assert_eq!((e.x, e.y, e.w, e.h), (20.0, 45.0, 60.0, 10.0));
     }
 
     #[test]

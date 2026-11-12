@@ -17,8 +17,18 @@ use rustgis_map::layout::{ElementKind, FontFamily, Layout, LineHead, PT_PER_MM, 
 use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, record_element, render_element};
 
 /// Writes `layout` as an SVG document, pictures drawn at `dpi`, and the elements (id and name)
-/// drawn as pictures because their vectors would pass the budget; `None` when the page can't be drawn.
-pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<(String, Vec<(u32, String)>)> {
+/// drawn as pictures because their vectors would pass the budget. Refuses a source changed during drawing.
+pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Result<(String, Vec<(u32, String)>), String> {
+    let revisions = crate::layout::archive_revisions(layout, maps);
+    let result = layout_svg_inner(layout, maps, dpi, info);
+    revisions.finish_revision(
+        crate::layout::archive_revisions(layout, maps),
+        result,
+        "could not draw the page; check its map sources and export size",
+    )
+}
+
+fn layout_svg_inner(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Option<(String, Vec<(u32, String)>)> {
     let mut defs = vectors::Defs::default();
     let mut pictured = Vec::new();
     let mut body = elements(layout, maps, dpi, info, &mut defs, &mut pictured)?;
@@ -69,7 +79,7 @@ fn elements(
         let _ = writeln!(s, r#"<g id="element-{}" inkscape:label="{}" inkscape:groupmode="layer">"#, e.id, esc(&e.name));
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
         match &e.kind {
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name } => {
+            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation } => {
                 let first = layout.first_frame().and_then(|id| layout.element(id)).and_then(|f| match &f.kind {
                     ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
                         let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
@@ -102,7 +112,7 @@ fn elements(
                 };
                 let _ = write!(
                     s,
-                    r#"<text x="{}" y="{}" font-family="{}" font-size="{}" font-weight="{}" font-style="{}" text-anchor="{anchor}" letter-spacing="{}"{} xml:space="preserve">"#,
+                    r#"<text x="{}" y="{}" font-family="{}" font-size="{}" font-weight="{}" font-style="{}" text-anchor="{anchor}" letter-spacing="{}"{} xml:space="preserve""#,
                     num(tx),
                     num(lines.first().map_or(y + em * 0.6, |l| l.0)),
                     esc(&family),
@@ -112,6 +122,12 @@ fn elements(
                     num(*letter_spacing * 1.33 / PT_PER_MM),
                     paint("fill", *color),
                 );
+                // Turned about the box's centre: clockwise, as SVG's `rotate` turns on a page whose
+                // y runs down.
+                if *rotation != 0.0 {
+                    let _ = write!(s, r#" transform="rotate({} {} {})""#, num(*rotation), num(x + w / 2.0), num(y + h / 2.0));
+                }
+                s.push('>');
                 match lines.as_slice() {
                     [(_, only)] => s.push_str(&esc(only)),
                     many => {
@@ -334,13 +350,38 @@ mod tests {
         layout
     }
 
+    /// A turned text is written with SVG's `rotate` about its box's centre (#1763); an upright one
+    /// without it, as before.
+    #[test]
+    fn a_turned_text_is_written_rotated() {
+        let svg = |turn: f64| {
+            let mut layout = Layout::new("SVG", 100.0, 80.0);
+            let mut kind = ElementKind::text("Fonte: IBGE", 10.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { rotation, .. } = &mut kind {
+                *rotation = turn;
+            }
+            layout.add("Source", (10.0, 30.0, 60.0, 10.0), kind);
+            layout_svg(&layout, &mut [], 96.0, &PageInfo::default()).unwrap().0
+        };
+        assert!(!svg(0.0).contains("rotate("));
+        assert!(svg(-90.0).contains(r#"transform="rotate(-90 40 35)">Fonte: IBGE</text>"#), "{}", svg(-90.0));
+    }
+
     #[test]
     fn surrounds_on_a_frame_keep_the_picture_resolution() {
         let (mut layout, _, frame) = page();
         layout.add(
             "Legend",
             (10.0, 10.0, 40.0, 30.0),
-            ElementKind::Legend { frame, title: "Map legend".into(), all_classes: true, hide_other: false, exclude: vec![] },
+            ElementKind::Legend {
+                frame,
+                title: "Map legend".into(),
+                all_classes: true,
+                hide_other: false,
+                exclude: vec![],
+                columns: 1,
+                labels: Default::default(),
+            },
         );
         assert_eq!(picture_dpi(&layout, 600.0, |e| !written_as_svg(e)), 600.0);
         // A frame and an inset filling an A0 page that is already drawn at its pixel limit.
@@ -371,7 +412,15 @@ mod tests {
         let legend = layout.add(
             "Legend",
             (10.0, 10.0, 40.0, 30.0),
-            ElementKind::Legend { frame, title: "Map legend".into(), all_classes: true, hide_other: false, exclude: vec![] },
+            ElementKind::Legend {
+                frame,
+                title: "Map legend".into(),
+                all_classes: true,
+                hide_other: false,
+                exclude: vec![],
+                columns: 1,
+                labels: Default::default(),
+            },
         );
         let info = PageInfo::default();
         let (svg, pictured) = layout_svg(&layout, &mut maps, 72.0, &info).unwrap();
@@ -438,7 +487,7 @@ mod tests {
         assert!(svg.contains(&format!(r#"<g transform="translate({} {}) scale("#, num(x), num(y))), "{svg}");
         layout.element_mut(id).unwrap().x = 110.0;
         assert!(render_element(&layout, id, &mut maps, 36.0, &info).unwrap().is_none());
-        assert!(layout_svg(&layout, &mut maps, 36.0, &info).is_some(), "an off-page image is harmless");
+        assert!(layout_svg(&layout, &mut maps, 36.0, &info).is_ok(), "an off-page image is harmless");
     }
 
     #[test]
@@ -450,7 +499,7 @@ mod tests {
         let mut source = rustgis_map::source::SourceLayer::default();
         source.path = Some(dir.path().join("missing.shp").display().to_string());
         maps[0].layers[0].source = Some(source);
-        assert!(layout_svg(&layout, &mut maps, 72.0, &PageInfo::default()).is_none());
+        assert!(layout_svg(&layout, &mut maps, 72.0, &PageInfo::default()).is_err());
     }
 
     #[test]

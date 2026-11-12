@@ -129,10 +129,23 @@ For polygons, **No Fill** in the Symbology pane or **Style › Drawing** draws o
 It keeps each symbol's outline colour and width, including in Unique Values and Graduated Colors,
 without changing the classes. Change the outline with **Outline color** and **Outline width** in
 the Single Symbol editor, or `layer.outline` for all classes. Undo restores the previous fills;
-the colour picker's opacity control can also make a fill visible again. By command:
+the button also changes to **Restore Fill**, which puts the fills back as they were: their
+colours and opacities, the layer's own fill layers and each class's. A fill that was transparent
+before No Fill stays transparent, and a class colour, outline or label changed while No Fill is on
+is kept. Fills shown while No Fill is on (a class's fill layers, or a class colour with an
+opacity) show until No Fill is chosen again, which hides them too and keeps them for Restore Fill
+in place of what it kept for those classes. A new symbology, colour scheme or fill colour (`layer.symbology`, `layer.ramp`,
+`layer.color`), a saved style applied (`style.apply`), a QGIS style with symbols (`style.importQgis`), subtypes that symbolize the layer
+(`data.subtypes`), or fill layers in the symbol's colour for the whole layer (`layer.fillLayers`),
+turn No Fill off and draw the fills themselves, so Restore Fill is then no longer offered, and a
+notice counts the hidden fills that were dropped. On a mixed or streamed layer, where No Fill lays
+a transparent fill over the symbols, fill layers for the whole layer of any colour turn it off
+too, as they replace that fill. A project saved with No Fill on by an earlier RustGIS doesn't record the fills, so Restore Fill says what it couldn't put back.
+On a polygon layer the symbols' fills show at the default opacity; on a mixed or streamed layer the symbols keep their own opacity, and fill layers the layer or its classes had don't come back. By command:
 
 ```text
 layer.noFill={"layer":"Countries"}
+layer.restoreFill={"layer":"Countries"}
 ```
 
 A GeoJSON with mixed geometry keeps its points, lines and polygons in one layer, classified by its
@@ -153,10 +166,14 @@ With Unique Values or Graduated Colors, each class in the Symbology pane's list 
 and a legend label. Pick a colour and opacity to give that class its own. Type a label to show in the Layers
 pane and in layout legends instead of the value or range (for example `High income` for
 `1. High income: OECD`); clear it to show the value again. `<all other values>` can be edited the
-same way. Applying the symbology again on the same field keeps the colours, outlines and labels
-you set by hand on the classes that are still there (the others take the scheme's colours again);
-picking another colour scheme recolours every class but keeps the labels. A Graduated Colors
-class keeps its colour and label while its range stays the same. By command:
+same way. The list shows up to 200 classes. A style imported with more says below the list how many
+it leaves out: the list's limit doesn't change how they're drawn, and `layer.classStyle` edits them,
+a Unique Values class by its `value` (a value listed twice is drawn, and edited, as its first class)
+and a Graduated Colors class by its `index`. Applying the symbology again on the same field keeps
+the colours, outlines and labels you set by hand on the classes that are still there (the others
+take the scheme's colours again); picking another colour scheme recolours every class but keeps the
+labels. A Graduated Colors class keeps its colour and label while its range stays the same. By
+command:
 
 ```text
 layer.classStyle={"layer":"Countries","value":"1. High income: OECD","color":"#2E6B4F","label":"High income"}
@@ -181,6 +198,34 @@ same field, ranges and scheme also preserves opacity, including edits that chang
 As with other class colour edits, changing the field or graduated ranges starts fresh; choosing
 a different scheme through `layer.symbology` resets polygon opacity to its default.
 Layer/group transparency still applies on top of the symbol's opacity in maps and exports.
+
+**Invert Color Ramp** (Symbology pane, or `layer.invertRamp`) reverses the colours of a Graduated
+Colors or Unique Values layer's classes along the legend's order, so the highest class takes the
+lowest class's colour. Colours edited by hand travel with the reversal, but a polygon fill's
+opacity stays with its position in the legend, as it does when a colour scheme is applied: a
+semi-transparent fill picked for the first class is still the first class's opacity afterwards.
+Applying it twice gives the original back. The `<all other values>` swatch is no colour of the
+scheme and stays as it is. With fewer than two classes showing the scheme there is nothing to
+reverse, and the command says so instead of succeeding.
+
+A class whose own stack hides its symbol keeps it, and the others reverse among themselves; a
+notice says how many classes with a stack of their own were left as they are. A stack hides the
+symbol when it is drawn (stacked fills on a polygon layer, stacked strokes on a line or point
+layer; a polygon's stacked strokes and a line's stacked fills are not drawn) and every layer of it
+sets a colour of its own. A layer of a stack left on "follow the class" shows the class's colour,
+so that class reverses with the rest: a road's black casing over a core that follows the class.
+When the layer's own stack (the one classes without a stack of their own are drawn from) sets a
+colour in every layer, the classes show those colours and little of the colour scheme: the colours
+are reversed all the same, and a notice says so. On a layer that holds several kinds of geometry,
+the reversal treats every class as the layer's main kind, as choosing a colour scheme does.
+A fill or stroke colour from **Symbol by Expression** is drawn over the classes' colours wherever
+the expression gives one, so the reversal shows only where it gives none, and a notice says so.
+
+Choosing a colour scheme again starts from the scheme's own order, but classing the layer again
+on the same field, ranges and scheme keeps the reversed colours, as it keeps other colours edited
+by hand. On a Stretch raster the command switches the existing "Invert color scheme" option. A
+graphics layer draws each feature in its own style, so it has no colour scheme to invert and the
+command says so.
 
 ### Line strokes
 
@@ -406,6 +451,12 @@ dark text; culling makes room for it, so labelled charts stay visible to their l
 The categories list under the layer's classes in layout legends — the printed map's legend lists
 them the same way. Clearing the diagram leaves the renderer as it is.
 
+Charts lie flat on the map. On extruded polygons they draw over the extrusion while a flat map is
+untilted, but not while it is tilted; the globe draws extruded polygons flat, charts and all. On a
+point layer in a tilted view the markers stay on the ground under their charts rather than standing
+up, and aggregated points draw their bins, not the charts. Setting a diagram, aggregation or
+extrusion that can hide the charts says so.
+
 ## Labeling
 
 The **Labeling pane** brings together the label classes and the chosen class's field, SQL
@@ -481,6 +532,17 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
   Lock keeps the ones placed. The distance grows with the labels at a reference scale
   (`labels.placement={"layer": "Rivers", "position": "curved", "repeat": 144}`; `null` or `0` is
   the one at the middle).
+- **Distance from the line**: a label placed along a line (Parallel or Curved) set off it, so it
+  doesn't sit over the line it names (Labeling pane › Position › **Distance**, 0 to 200 points, with
+  **Above** or **Below**). The distance runs from the line to the text's nearest edge, and above and
+  below are as the text reads, not north and south: over a level road the label is higher on the
+  screen, beside a road read downward it is to its right. Curved, each character moves off with its
+  own part of the line, so the text keeps following it; where the line bends so tightly that the
+  characters on the inside of the bend would run into one another, the place is left out, as one
+  too sharp to curve is. Repeats and other places along the line sit off it the same way, Lock keeps
+  them where they were found along the line, and the distance grows with the labels at a reference
+  scale (`labels.placement={"layer": "Rivers", "lineOffset": 4}`; negative is below, `0` or `null`
+  on the line).
 - **Show all labels** (Labeling pane › Position): labels among the view's 20,000 highest-priority
   candidates are drawn, over the others where
   they crowd, rather than some left out (`labels.placement={"layer": "Cities", "showAll": true}`).
@@ -555,6 +617,10 @@ Turn labels on per layer (Labeling › Labels › **Label**), then:
 - **Convert** (Labeling › Map Labeling, or Layers › right-click › **Convert To Annotation**) turns a
   layer's labels into an annotation layer: one point per label, carrying its
   text in a `TEXT` field, which you can then edit, move or delete like any other features.
+  A label along a line becomes an upright point at its line's middle vertex (the end of a line
+  of two), which can be some way from where the label was drawn: its angle, curve, repeats and
+  distance from the line are left out, and the conversion says how many, and how many of them
+  belong to a class that repeats along lines (each becomes one point).
 - **Label classes** label different features differently, such as large cities in larger text.
   Each class has a SQL clause choosing its features, and its own field, text symbol, placement
   and visibility range. Each class labels every feature its clause matches, the **Default**

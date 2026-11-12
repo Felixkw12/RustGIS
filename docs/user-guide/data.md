@@ -28,7 +28,7 @@ Formats](data-formats.md).
 | ASCII grid (`.asc`, with an optional `.prj`) | Yes | No |
 | Unreferenced TIFF and PNG scans; JPEG with `"as": "scan"` | Yes | GeoTIFF after georeferencing |
 | Through GDAL: JPEG 2000, ERDAS Imagine, SRTM HGT, DTED, NetCDF, HDF, ENVI, SAGA… | Yes (desktop, when GDAL is installed) | No |
-| Web tiles: XYZ/TMS/WMS rasters, Mapbox Vector Tiles, MapLibre styles, PMTiles and MBTiles archives | Yes | Yes (Analyze › Create Hosted Imagery) |
+| Web tiles: XYZ/TMS/WMS rasters, Mapbox Vector Tiles, MapLibre styles, PMTiles and MBTiles archives | Yes | Yes (Imagery › Create Hosted Imagery) |
 | RustGIS project (`.rgis`; older `.rgisx` files open too) | Yes | Yes |
 
 Add data with **Home › Add › Add Data**: its main button opens the file picker, and its menu offers
@@ -44,8 +44,29 @@ double-clicked in the Browser: **Choose Layers** lists them, all ticked, with **
 **Select None** and a filter for a long list. Turn **Ask Which Layers to Add** off in the Add Data
 menu to add every layer, as before. Scripts pick one with `layer.addData`'s `"layer"`;
 `info.fileLayers` lists them.
+A KML, KMZ, GPX, OpenStreetMap, DXF, LandXML or GeoRSS file, a zip of Shapefiles or a File
+Geodatabase that RustGIS reads itself, with layers of several geometry types, adds its polygons
+first and its points last, so its points are drawn on top, and a KML's ground overlays go under
+them. A name given goes to the first map layer added, the bottom one (a standalone table only gets
+it when the file has no map layer). A GeoPackage adds its tables in name order, and a file read
+through GDAL keeps its layers in the file's order and orders only the types within each layer.
+GeoPackage attribute-only tables are not supported. Adding a whole file reports their count in
+one notice. Tile and other unsupported GeoPackage contents are also counted by type. The omission counts cover catalog entries without a registered geometry column; unknown content types are combined into one counted "other" group. Only contents registered in `gpkg_contents` are considered; arbitrary unregistered SQLite tables are ignored. Desktop uploads add their first feature table, with the existing note naming how many feature tables the file contains. Browser uploads with virtual generated `table_name` or `data_type` catalog columns cannot be evaluated and are refused with an explanation; materialize these columns or select a feature table explicitly. A file
+containing only attribute tables is refused with the count. Selecting a
+feature table explicitly adds only that table.
 On the desktop, **Home › Add › Add Data › Add Folder…** connects a folder to the Browser; the web
 app does not offer folder connections.
+On the desktop, a file Add Data reads whole (a GeoTIFF or another raster, one GDAL converts, a
+GeoJSON of up to 32 MB, delimited text or a spreadsheet) is read in the background, so the map
+and the rest of the window stay in use: the status bar shows **Add Data**, how many files wait
+after it, and **Cancel**. Files dropped or added together are read one at a time and added in
+that order; one that asks which layers to add joins them once you choose. Cancel drops the file
+being read and those waiting; opening another project, or switching to another map, drops them
+too, and a message says so (the files waiting are counted, not named). A file read in place, a web
+service or a database adds as before, and scripts read the file where the command runs. So does
+**Delimited Text…**: it reads the file with the columns picked as you press **Add**, so a read
+that fails (a column that isn't in the file, a coordinate system it doesn't know) keeps the
+dialog open for another try.
 **Home › Add › Add Data › Delimited Text…** asks for a CSV or a spreadsheet first, then lists its columns to pick the x and y (or WKT)
 ones from, with the coordinate system (such as `EPSG:2263`) and the separator (changing it reads
 the columns again); `info.fileColumns` lists them for scripts. Add Data finds them itself
@@ -59,6 +80,13 @@ the table's name beside it (`input_name`). The **XY Table To Point** tool
 ([Geoprocessing](analysis.md), and a table's right-click menu) makes points of a table already in
 the project, from two fields of coordinates and their coordinate system. In a text field a single comma is the decimal separator
 (`1,234` is 1.234); thousands separators are not read.
+Excel `.xls` records, formula operands and sheet bounds are checked before opening, including
+sheets that were not selected. The workbook shares a memory budget across its sheets and retained
+metadata. Value and formula grids are counted separately, with conservative estimates for
+formula strings, defined names and sheet state. Formula-heavy workbooks can reach this budget
+before their value-grid limit. A file with damaged records or excessive allocations is refused with the reason. Normal
+cached formula values are read. A formula's direct cell reference to row 65,536 is currently
+refused because the XLS reader cannot handle that reference safely.
 **Home › Add › Add Data › Graphics Layer** adds a layer for [drawn graphics](cartography.md#graphics),
 and **Data › Layer Templates** adds empty layers with ready-made schemas to draw into.
 
@@ -70,13 +98,59 @@ coordinate system and are reprojected as they draw. The map uses Web Mercator by
 
 ESRI `.prj` files without an EPSG code use their projection parameters and, for ED50,
 Monte Mario (from Greenwich or from Rome), OSGB36, DHDN, Amersfoort, GGRS87, CH1903/CH1903+
-and S-JTSK, the same built-in Helmert datum transformation as the EPSG definition. A `TOWGS84`
-transformation in the file takes precedence. RDN2008 and IGM95 are treated as WGS 84-like
-datums. These transformations do not replace regional grid corrections for survey accuracy. An
-unrecognized datum keeps its ellipsoid and produces a notice when no transformation is
-available. Swiss oblique Mercator, the standard Krovak East/North variant, and the oblique
-Mercator, Cassini-Soldner, polyconic and Equal Earth methods are supported from their
-parameters.
+and S-JTSK, the same built-in Helmert datum transformation as the EPSG definition. In a `.prj`
+or other WKT:
+
+- A transformation in the file (a `TOWGS84`, or a WKT2 `BOUNDCRS`'s) takes precedence, also over
+  the built-in one of an EPSG code in the WKT, as in PROJ and GDAL. A system RustGIS can read
+  only by that code keeps the code's transformation, with a notice. Web Mercator is on WGS 84, so
+  a transformation its file gives is set aside, with a notice.
+- A `BOUNDCRS` whose transformation goes to another datum than WGS 84 continues with that
+  datum's own transformation to WGS 84: the one the file gives it, else none for a datum treated
+  as WGS 84 (such as RDN2008, IGM95 or NAD 83), else the built-in one. It is refused when there is
+  none of these, when the target gives a zero transformation where its datum has another (a
+  writer's placeholder, as for ED50 or NAD 27), or when combining the two transformations'
+  rotations could be off by a centimetre.
+- A UTM name (`WGS_1984_UTM_Zone_31N`) gives its EPSG code only when the parameters are that
+  zone's.
+- Transverse Mercator (South Orientated), the method GDAL and Esri write South Africa's Lo grids
+  with, counts westings and southings, and is read so, its false easting and northing as a false
+  westing and southing. Read from its parameters, a system declaring other axes is refused; one
+  with an EPSG code (EPSG:2048, say) is read by the code, as the code defines it, whatever axes
+  its WKT declares.
+- Projected axes pointing west or south, as in South Africa's Lo grids, are read as such, or
+  refused where they can't be (Web Mercator, Krovak, sinusoidal, or such axes declared northing
+  first, as in Austria's Ferro grids).
+- A WKT1 or Esri projection's angles (its latitude of origin, central meridian, standard
+  parallels, azimuth) and its prime meridian are in its geographic system's unit, such as grads
+  for NTF (Paris)'s Lambert zones, as PROJ reads them. The Paris meridian written as 2.33722917,
+  in degrees as GDAL and Esri write it whatever the unit, is read in degrees.
+
+RDN2008 and IGM95 are treated as WGS 84-like datums. These transformations do not replace
+regional grid corrections for survey accuracy. An unrecognized datum keeps its ellipsoid and
+produces a notice when no transformation is available. Swiss oblique Mercator, the standard
+Krovak East/North variant, the oblique Mercator in its azimuth forms (the two-point form, with
+no azimuth, is refused), and the Cassini-Soldner, polyconic and Equal Earth methods are
+supported from their parameters, as are sinusoidal (MODIS), Robinson, orthographic and Mercator
+(variant A), in `.prj` files and in GeoTIFF keys. Esri's orthographic is a spherical projection:
+on an ellipsoid it is refused, with a notice, rather than computed as EPSG's ellipsoidal one.
+The equidistant cylindrical projection (EPSG:4087, World Equidistant Cylindrical) uses a sphere of its datum's
+semi-major axis, matching legacy PROJ/GDAL coordinates (verified with PROJ 9.7.1), both for data
+and for a map drawn in it (including the
+Equirectangular preset). This also applies to planetary Equirectangular systems and definitions
+that name EPSG method 1028. Shapefile and ASCII-grid `.prj` files and GeoPackage WKT definitions
+whose method is interpreted as EPSG 1028 on an ellipsoid report the formula difference,
+without assuming how the producer computed its coordinates. Effectively spherical definitions
+need no warning. Code-only CRS identifiers use the same compatibility formula without a method
+warning, since no explicit WKT method is being read. Typed WKT inputs also report the method
+difference: Add Data overrides, Define Projection, CSV imports, measured layout grids, Zarr
+inputs, vector exports, XY Table To Point and Kernel Density. ASCII-grid sidecars retain
+datum warnings as well as the projection warning. RustGIS applies the same compatibility formula to GeoTIFF CT 17;
+this key identifies a GeoTIFF transformation, rather than explicitly declaring EPSG method 1028.
+[PROJ 9.9](https://proj.org/en/stable/operations/projections/eqc.html) supports the ellipsoidal
+formula instead. RustGIS preserves coordinates for files created with the legacy spherical formula. Files created with an ellipsoidal EQC formula, including PROJ 9.9 output, can be misplaced by kilometres; check which formula the producer used.
+The datum's ellipsoid is retained for datum transformations and
+exported coordinate system definitions.
 
 Shapefile text uses a supported `.cpg` encoding, otherwise the `.dbf` code page, with UTF-8 as
 the fallback. Keep the sidecar files together.
@@ -94,7 +168,8 @@ fields, calculates field [expressions](expressions.md) and opens **Calculate Geo
 The geometry calculator fills a new double field or an existing numeric field with area,
 perimeter, length or point X/Y, for all or selected features. Point coordinates can be WGS 84
 degrees or a supported projected EPSG system's units. Areas, perimeters and lengths measure on
-the WGS 84 ellipsoid, with the exceptions for full-turn and polar rings listed under
+the WGS 84 ellipsoid; how full-turn rings (globe-wide bands) and rings split at the antimeridian
+are measured, and the exception for polar rings, are under
 [Geoprocessing](analysis.md#geoprocessing-tools).
 See [Editing](editing.md) for field
 calculations and data-design rules. Streamed layers must first be loaded with **Load All
@@ -103,7 +178,7 @@ Features**.
 ## Formats through GDAL
 
 When [GDAL](https://gdal.org) is installed (its `ogr2ogr` and `ogrinfo` programs on the `PATH`,
-or the folder holding them in `RUSTGIS_GDAL_BIN`; GDAL 3.7 or later), the desktop app also opens
+or the folder holding them in `RUSTGIS_GDAL_BIN`; GDAL 3.8 or later), the desktop app also opens
 the vector formats GDAL reads: DWG, MapInfo TAB, OpenStreetMap XML, File Geodatabases RustGIS
 can't read itself (compressed ones, or ones with raster fields)
 and more. RustGIS doesn't link to GDAL: each layer is converted once, by `ogr2ogr`, into a
@@ -111,11 +186,11 @@ FlatGeobuf with a spatial index in WGS 84 (GDAL reprojects it), kept in the cach
 (`~/.cache/rustgis/gdal` on Linux, `~/Library/Caches/RustGIS/gdal` on macOS,
 `%LOCALAPPDATA%\RustGIS\cache\gdal` on Windows, or `RUSTGIS_GDAL_CACHE`). Adding the file again
 reuses the conversion until the file changes, and large layers stream like any large FlatGeobuf
-(below). Every layer of the file is added; a layer mixing geometry types is
-added as one layer per type. Curves become straight segments, and 3D surfaces (an Esri
-multipatch, such as the buildings of swissBUILDINGS3D, is read as a TIN) become flat
-polygons, one part per face, without their heights. Projects remember the original file and
-convert it again if the cached copy is gone.
+(below). Every layer of the file is added; a layer mixing geometry types is added as one layer
+per type, its points on top and its polygons at the bottom. Curves become straight segments, and
+3D surfaces (an Esri multipatch, such as the buildings of swissBUILDINGS3D, is read as a TIN)
+become flat polygons, one part per face, without their heights. Projects remember the original
+file and convert it again if the cached copy is gone.
 
 ## SQL queries and DuckDB databases
 
@@ -151,7 +226,8 @@ WHERE bbox.xmin BETWEEN -83.95 AND -83.89 AND bbox.ymin BETWEEN 35.94 AND 35.98
 The first geometry column becomes the layer's geometry; other columns become its attributes (types
 RustGIS doesn't read, such as dates and lists, as text). A geometry that says its coordinate system
 is converted to longitude/latitude; give `"crs"` (such as `EPSG:2263`) for one that doesn't. A
-result mixing geometry types becomes a layer per type, and rows without a geometry are left out.
+result mixing geometry types becomes a layer per type (points on top, polygons at the bottom), and
+rows without a geometry are left out.
 `"database"` opens a DuckDB database (read only) so the query names its tables plainly; the
 database is trusted like the query, since its views run as part of it.
 
@@ -183,9 +259,10 @@ so only those cross the network. Smaller tables are loaded whole, so they can be
 server converts geometry to longitude/latitude (`ST_Transform`, so every coordinate system in its
 `spatial_ref_sys` works) and curves to lines; give `"crs"` (such as `EPSG:2263`) for a column whose
 geometry doesn't say its coordinate system. A column of mixed geometry types becomes a layer per
-type, and empty tables (such as the TIGER geocoder's) are left out. Features keep their ids between
-views: the table's integer primary key, else the row's place in the table (the rows of a view or
-a partitioned table without a key are numbered as read, so theirs can change between views).
+type, points on top, and empty tables (such as the TIGER geocoder's) are left out. Features keep
+their ids between views: the table's integer primary key, else the row's place in the table (the
+rows of a view or a partitioned table without a key are numbered as read, so theirs can change
+between views).
 
 Passwords are never written to the project. By default, an entered password lasts until
 RustGIS closes. For a named desktop connection, **Remember on this computer** is an unchecked
@@ -232,7 +309,7 @@ back to it. In **Home › Add › Add Data › Database…**, give a PostgreSQL 
   password, `PGPASSWORD` or libpq's password file serve.
 - The table (`pg.addLayer`; `pg.tables` lists those with a geometry or geography column) loads
   whole, up to 100,000 rows a layer, in the order of its key.
-  A table whose geometries are of several types loads each type as its own layer, each up to that many.
+  A table whose geometries are of several types loads each type as its own layer (points on top), each up to that many.
   A **condition** (an SQL expression on its columns, such as `population > 10000`) loads only the
   rows it keeps. The layer is an ordinary layer in memory, so every editing tool works on it.
 
@@ -372,8 +449,9 @@ a capped view is an evenly spread sample numbered on the server; smaller ones ar
 RustGIS converts the geometry to longitude/latitude itself (MariaDB has no `ST_Transform`), from
 the column's SRID (MySQL's per-column SRID, MariaDB's `REF_SYSTEM_ID`) or else its rows'; give
 `"crs"` (such as `EPSG:2263`) for a column whose SRID is 0. A `GEOMETRY` column of mixed types
-becomes a layer per type. Features keep their ids between views from the table's integer primary
-key; a table without one has its rows numbered as read, so theirs can change between views.
+becomes a layer per type, points on top. Features keep their ids between views from the table's
+integer primary key; a table without one has its rows numbered as read, so theirs can change
+between views.
 
 Passwords are never written to the project and last for the session unless you opt in with
 **Remember on this computer** for a named desktop connection. The same exact-address reconnect,
@@ -600,6 +678,21 @@ database is kept without its password. The commands `sources.list`, `sources.sav
 `sources.favourite` and `sources.remove` read and change the lists, for the command line and the
 [AI Assistant](assistant.md). On the command line they last for the run.
 
+### Network downloads
+
+On desktop and the command line, web tiles, service documents and file downloads through
+**From URL…** connect directly, including `layer.addUrl`. These requests do not use
+`HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY`: a proxy could resolve a destination beyond the
+app's IP checks. There is no proxy override for these requests. If your network requires a
+proxy, download a file with a trusted external tool and open the local copy in RustGIS.
+Live tile and service access requires direct connectivity. The web app uses the browser's
+network settings. Browser GET and HEAD requests refuse redirects, including HTTP-to-HTTPS upgrades
+and CDN hops, because the app cannot inspect their destinations. This includes **From URL…**
+file downloads, fonts, service documents, tiles and sprites, and PMTiles/COG archive range
+reads. Supply the final address; for a redirecting file download, download it with a trusted
+external tool and open the local copy. The browser also controls DNS and local-network access;
+see [tile request limits](maps.md#basemaps).
+
 ### HTTPS certificates
 
 On desktop and the command line, RustGIS's HTTPS clients use platform certificate verification:
@@ -616,7 +709,8 @@ inspection proxy's) must be trusted by the operating system for the account runn
   variables select the trust sources instead of the default system locations (an empty
   `SSL_CERT_DIR` counts as unset).
   If no default system roots are found and neither variable is set, this client falls back to
-  its bundled Mozilla roots, so public HTTPS still works in minimal containers. It does not
+  its bundled Mozilla roots, so public HTTPS still works in minimal containers, and says so
+  once a session (in the status bar and the troubleshooting history). It does not
   add Mozilla roots to an existing CA store (even one it can't read) or an explicitly configured one.
 
 `SSL_CERT_FILE` and `SSL_CERT_DIR` do **not** override Windows or macOS trust for this client.
@@ -648,6 +742,16 @@ it: web-service, catalogue, STAC and S3 requests run in the background on both d
 database tests run synchronously on desktop. The web app doesn't offer database kinds for new
 connections; saved database rows remain visible but cannot be opened or tested there. Earth
 Search and Planetary Computer remain available under **Library**.
+
+For a new web-service connection, enter its Basic password or header API key to test it before
+saving. The test uses only the entered login, not a saved service login or an S3 session login
+at the same address.
+For an `http://` address, tick the confirmation before sending the login unencrypted. After a test
+starts, RustGIS clears the password or key and the confirmation from the form; enter them again
+if you want to save a session login. The test does not save the connection or retain its login.
+Test status masks echoed login credentials, and the command log keeps response sizes rather than
+response bodies.
+For an existing service connection, save changes to its address or login definition before testing.
 
 **From Service…** (including **Catalogue search (CSW)**), **Database…**, **STAC Search…** and
 **S3…** can use saved connections directly. Service, database and S3 dialogs offer a **Saved
@@ -819,18 +923,37 @@ connection's kind doesn't change: make a new one); renaming the connection or ch
 at the same origin does not. **Log Out**
 (`connection.logout`) removes the session login. Log in again when a new session needs it.
 
+Creating a login requires secure random numbers: the operating system's generator on desktop,
+or the browser's `crypto.getRandomValues` in the web app. If that source is missing or fails,
+RustGIS refuses the login rather than using a predictable fallback. A failed replacement leaves
+the previous active login usable.
+
 A login is sent only to the connection's origin: the same scheme, host and port, for its
 capabilities, listings, tiles, feature pages and refreshes. On the desktop a redirect within that
 origin keeps the login, and a redirect to another origin is followed without it, never getting
 another connection's login either. In the web app a request carrying a login isn't redirected at
 all, since the browser can't take the login off on the way: a service that redirects (to
 `https://` or to another path) fails there, so save the connection with the address it ends at.
+Service documents cannot supply a login binding. While resolving their links, RustGIS inherits
+only the login used to read the document, and only at that same origin. A runtime wrapper in a
+document link contributes its ordinary URL, never its login.
+Relative links, including parent paths, resolve against the document's address without rewriting
+template placeholders or query values, including proxy parameters containing `https://` URLs.
+KVP requests replace capabilities operation parameters, keeping unrelated parameters such as
+MapServer's `map=`.
+A same-origin link whose path or query holds a space, backslash or control character keeps the
+login: tabs, line breaks and trailing spaces are dropped, a backslash in the path becomes `/` and
+other spaces, control characters and backslashes are percent-encoded (a space as `%20`).
 If a service supplies a same-origin link too long to carry its login, the request is refused
 instead of being fetched anonymously. Addresses that cannot be rebound to a login are left
 unchanged and reported.
 A plain `http://` address sends the login unencrypted, so the form asks for confirmation
 and the command needs `"allowInsecure": true`. Error messages, notices, the preferences,
 projects, History and what the [AI Assistant](assistant.md) sees never hold the password or key.
+On the desktop, a failed HEAD request that carried a web-service login records the HTTP status
+without response headers, including after logout or a redirect to another origin: a server could
+echo credentials in those headers. HEAD requests that never carried a login keep their selected
+diagnostic headers on refusal.
 Runtime login bindings are also removed from recorded command parameters, including addresses
 embedded in text, when saving, recovering or exporting them. The live session keeps its originals.
 
@@ -870,6 +993,9 @@ local file's view holds more than 250,000 features (100,000 in the web app), the
 evenly spread sample of them and its tooltip in Layers says so: zoom in to see them all. Remote files have lower limits (see
 [Data formats](data-formats.md)). Smaller files load
 whole; `layer.addData` with `"stream": true` or `false` overrides the choice.
+
+On the desktop, **Load All Features** from the layer's menu in Layers reads its features in the
+background, with **Cancel** in the status bar; the layer stays streamed until they are all read.
 
 On the desktop, opening a large Shapefile for the first time scans its record headers to build
 a disposable SQLite index outside the dataset directory. Reopening an unchanged file reuses
@@ -1003,7 +1129,9 @@ descriptions GDAL and rasterio write inside a GeoTIFF (its `GDAL_METADATA` tag) 
 too, a sidecar's taking precedence.
 Exporting a raster opened from an overview writes that overview; the results of adding and of
 exporting it (`layer.addData`, `share.exportRaster`) give the full size as `overviewOf`, so scripts
-and the MCP server see it too.
+and the MCP server see it too. A GeoTIFF read in place that is added before its overview is in
+(the desktop app, the browser) answers `"reading": true`, sized by its header when that is in, and
+with `null` for its size and bands until then.
 `share.exportRaster` writes an untiled GeoTIFF; with `"cog": true` it writes a cloud-optimised one:
 512-pixel tiles compressed with Deflate, overviews (each half the size of the last, down to one
 tile), and every directory ahead of the tiles, so a reader fetches the header once and then only the
@@ -1068,7 +1196,16 @@ steps where they meet. `raster.stretch` with `{"like": "<layer>"}` gives a layer
 of another layer's stretch as fixed bounds, so the tiles match; `{"type": "custom", "min": …,
 "max": …}` sets the bounds yourself.
 
-Clicking a raster with the Explore tool shows its pixel values. Projects remember a raster's file
+Clicking a raster with the Explore tool shows its pixel values. On a raster of two bands or more,
+the pop-up's **Spectral Profile** button charts every band at that pixel and opens the profile, where
+more points are compared (see [Spectral Analysis](analysis.md)). A band's wavelength is read from the
+GeoTIFF's GDAL metadata or its `.aux.xml` sidecar: GDAL's `CENTRAL_WAVELENGTH_UM` (its `IMAGERY`
+domain), or a `wavelength` or `central_wavelength` item (as rasterio, STAC exports and ENVI files
+through GDAL write them) in the unit a `wavelength_units` item gives. With no unit, a value under 100
+is read as micrometres and any other as nanometres: imaging sensors see from about 0.3 to 15 µm, so
+the two never meet. One that isn't a length from 1 nm to 1 m, or another length for a band that has
+one, is said and left out. A GeoTIFF export writes the wavelengths of the bands it writes (one
+band, or a raster's RGB) back as `CENTRAL_WAVELENGTH_UM`. Projects remember a raster's file
 path relative to the project and reopen it; rasters added in the browser are stored inside the project.
 
 ### Zarr stores
@@ -1181,13 +1318,19 @@ routes, areas, observations…) to draw into. Add Folder connects a folder to th
 also lists the project's layouts, styles and tasks. A task's steps each run a command; New Task
 From History turns the geoprocessing history into a task you can replay.
 
-Saved projects, map and layer files, and packages keep no password, key, token or signature in
-layer web addresses. The open project keeps them for this session. RustGIS remembers the 32 most
-recent distinct saved snapshots whose addresses needed stripping. Opening a plain `.rgis` file
-whose bytes exactly match one of those snapshots restores its secrets; saving more distinct
-snapshots evicts the oldest. Changed files, packages, imports and files saved by another process
-never restore secrets. After a snapshot is evicted or RustGIS closes, add those layers again with
-their credentials.
+Saved projects, templates, map and layer files, and packages remove recognized credentials from
+supported addresses and recognized executable parameters. The open project keeps its credentials. Removal
+notices describe what a shared workflow or video will need again; an unchecked-content notice
+means opaque content was kept and needs your review. Unrecognized credentials can remain in
+addresses without a notice, so review addresses and preserved content before sharing.
+
+RustGIS remembers up to 32 distinct saved snapshots for explicit project reopening, with at most
+1 MiB of restoration data per snapshot and 8 MiB in total. A snapshot must match, and only its
+recorded, unchanged fields can regain credentials. Larger restoration records are not remembered;
+a notice says so. Imports, packages and peer exchanges do not use this memory. After eviction or
+closing RustGIS, sign in again or add the protected sources with their credentials. Feature data
+and user text remain data, so review them before sharing.
+
 A layer added from a saved web-service connection records the connection's id (`"connection"`
 in the `.rgis` file; never its login), so the project needs no token in its addresses. See
 [Web-service logins](#web-service-logins) for what happens when it opens where that connection or
